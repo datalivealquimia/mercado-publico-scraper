@@ -1,31 +1,55 @@
 """
 Mercado Público Scraper - Compra Ágil
-Scraping con headers seguros para evitar bloqueos
+Usa Playwright para evitar bloqueos de CloudFront + BeautifulSoup para parseo
 """
-import requests
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from datetime import datetime
 from typing import List, Optional
 import logging
+import re
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-}
-
 BASE_URL = "https://buscador.mercadopublico.cl/compra-agil"
+
+
+def create_browser():
+    """Crea un browser stealth para evitar detección"""
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+            '--window-size=1920,1080',
+            '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        ]
+    )
+    context = browser.new_context(
+        locale='es-CL',
+        timezone_id='America/Santiago',
+        permissions=['geolocation'],
+        viewport={'width': 1920, 'height': 1080}
+    )
+    page = context.new_page()
+    
+    # Ocultar webdriver
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+    """)
+    
+    return playwright, browser, page
 
 
 def build_url(
@@ -61,98 +85,110 @@ def scrape_page(
     order_by: str = "recent"
 ) -> dict:
     """
-    Scraper una página de resultados de Compra Ágil
-    
-    Args:
-        date_from: Fecha inicio (YYYY-MM-DD)
-        date_to: Fecha fin (YYYY-MM-DD)
-        status: Estado (2 = Publicada)
-        region: Región (all = todas)
-        page: Número de página
-        order_by: Orden (recent, old, low_price, high_price)
-    
-    Returns:
-        dict con 'results' (lista de compras) y 'total' (total de resultados)
+    Scraper una página usando Playwright + BeautifulSoup
     """
     url = build_url(date_from, date_to, status, region, page, order_by)
     logger.info(f"Scraping: {url}")
     
-    response = requests.get(url, headers=HEADERS, timeout=30)
-    response.raise_for_status()
+    playwright, browser, page = create_browser()
     
-    soup = BeautifulSoup(response.text, "html.parser")
-    
-    # Extraer total de resultados
-    total_text = soup.find("p", string=lambda t: t and "resultados" in t.lower())
-    total = 0
-    if total_text:
-        import re
-        match = re.search(r'(\d+)', total_text.text)
-        if match:
-            total = int(match.group(1))
-    
-    # Extraer compras
+    try:
+        response = page.goto(url, wait_until="networkidle", timeout=30000)
+        logger.info(f"Status: {response.status}")
+        
+        # Esperar a que carguen los resultados
+        page.wait_for_selector("text=resultados", timeout=10000)
+        
+        # Obtener el HTML
+        html = page.content()
+        
+        # Parsear con BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Extraer total
+        total_text = soup.find(string=re.compile(r'resultados'))
+        total = 0
+        if total_text:
+            match = re.search(r'(\d+)', total_text)
+            if match:
+                total = int(match.group(1))
+        
+        # Extraer compras del HTML
+        compras = extract_compras(soup)
+        
+        return {
+            "results": compras,
+            "total": total,
+            "page": page,
+            "url": url,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    finally:
+        browser.close()
+        playwright.stop()
+
+
+def extract_compras(soup) -> List[dict]:
+    """Extrae compras del HTML parseado"""
     compras = []
     
-    # Buscar items de compra en el HTML
-    items = soup.find_all("div", class_=lambda x: x and "resultado" in x.lower() if x else False)
+    # Buscar todos los elementos que contengan códigos COT
+    texto_html = str(soup)
     
-    # También buscar por estructura conocida
-    if not items:
-        items = soup.find_all("div", {"data-id": True})
+    # Patrón para encontrar bloques de compras
+    # El código viene como: XXXX-XXX-COT26
+    patrones = re.findall(
+        r'(\d{4,5}-\d{1,3}-COT\d{2})\s*</.*?heading\s*"([^"]+)"[^>]*>.*?>([^<]+)<.*?'
+        r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})',
+        texto_html,
+        re.DOTALL
+    )
     
-    for item in items:
+    # Buscar de otra forma - por bloques
+    # Encontrar todos los códigos
+    codigos = re.findall(r'(\d{4,5}-\d{1,3}-COT\d{2})', texto_html)
+    
+    # Buscar títulos (h4)
+    titulos = soup.find_all('h4')
+    
+    # Buscar presupuestos
+    presupuestos = re.findall(r'\$\s*([\d.]+)', texto_html)
+    
+    # Buscar organismos - párrafos que contengan palabras clave
+    org_keywords = ['MUNICIPALIDAD', 'HOSPITAL', 'UNIVERSIDAD', 'DEFENSORIA', 'INSTITUTO', 'EJERCITO', 'FUERZAS']
+    organismos = []
+    for p in soup.find_all('p'):
+        text = p.get_text()
+        if any(kw in text.upper() for kw in org_keywords):
+            # Limpiar el texto
+            org = text.strip().split('\n')[0]
+            if org and len(org) > 5:
+                organismos.append(org[:100])
+    
+    # Buscar fechas de publicación y cierre
+    fechas_pub = re.findall(r'Publicada el\s*(\d{2}/\d{2}/\d{4})', texto_html)
+    fechas_cierre = re.findall(r'Finaliza el\s*(\d{2}/\d{2}/\d{4})', texto_html)
+    
+    # Armar las compras
+    for i in range(min(len(codigos), 15)):
         try:
-            compra = extract_compra(item)
-            if compra:
+            compra = {
+                "codigo": codigos[i] if i < len(codigos) else None,
+                "titulo": titulos[i].get_text().strip() if i < len(titulos) else None,
+                "organismo": organismos[i] if i < len(organismos) else None,
+                "presupuesto": f"$ {presupuestos[i]}" if i < len(presupuestos) else None,
+                "fecha_publicacion": fechas_pub[i] if i < len(fechas_pub) else None,
+                "fecha_cierre": fechas_cierre[i] if i < len(fechas_cierre) else None,
+                "estado": "Recibiendo cotizaciones"
+            }
+            if compra["codigo"]:
                 compras.append(compra)
         except Exception as e:
-            logger.warning(f"Error extrayendo item: {e}")
-            continue
-    
-    # Si no encontramos por clase, buscar por estructura
-    if not compras:
-        compras = extract_from_structure(soup)
-    
-    return {
-        "results": compras,
-        "total": total,
-        "page": page,
-        "url": url,
-        "timestamp": datetime.now().isoformat()
-    }
-
-
-def extract_compra(item) -> Optional[dict]:
-    """Extrae datos de un item de compra"""
-    # Implementar según estructura específica
-    return None
-
-
-def extract_from_structure(soup) -> List[dict]:
-    """Extrae compras desde la estructura del HTML"""
-    compras = []
-    
-    # Buscar todos los headings con códigos de compra
-    codigos = soup.find_all(string=lambda t: t and "COT" in t)
-    
-    for codigo in codigos:
-        try:
-            parent = codigo.find_parent()
-            if parent:
-                compra = parse_compra_element(parent)
-                if compra:
-                    compras.append(compra)
-        except Exception:
+            logger.warning(f"Error armando compra {i}: {e}")
             continue
     
     return compras
-
-
-def parse_compra_element(element) -> Optional[dict]:
-    """Parsea un elemento de compra individual"""
-    # Implementar según estructura específica
-    return None
 
 
 def scrape_all(
@@ -160,55 +196,49 @@ def scrape_all(
     date_to: str = None,
     status: str = "2",
     region: str = "all",
-    max_pages: int = 10,
+    max_pages: int = 5,
     delay: float = 2.0
 ) -> List[dict]:
     """
     Scraper múltiples páginas con delay entre requests
-    
-    Args:
-        date_from: Fecha inicio
-        date_to: Fecha fin  
-        status: Estado
-        region: Región
-        max_pages: Máximo de páginas a scrapear
-        delay: Segundos entre requests
-    
-    Returns:
-        Lista de todas las compras encontradas
     """
     import time
-    
     all_results = []
-    page = 1
     
-    while page <= max_pages:
+    for page_num in range(1, max_pages + 1):
         try:
-            data = scrape_page(date_from, date_to, status, region, page)
+            data = scrape_page(
+                date_from=date_from,
+                date_to=date_to,
+                status=status,
+                region=region,
+                page=page_num
+            )
             results = data.get("results", [])
             
             if not results:
                 break
                 
             all_results.extend(results)
-            logger.info(f"Página {page}: {len(results)} resultados")
+            logger.info(f"Página {page_num}: {len(results)} resultados")
             
-            if len(results) < 15:  # Última página
+            if len(results) < 15:
                 break
                 
-            page += 1
-            time.sleep(delay)  # Respetar delay para no bloquear
+            time.sleep(delay)
             
         except Exception as e:
-            logger.error(f"Error en página {page}: {e}")
+            logger.error(f"Error en página {page_num}: {e}")
             break
     
     return all_results
 
 
 if __name__ == "__main__":
-    # Ejemplo de uso
     print("Ejecutando scraping de prueba...")
     data = scrape_page()
     print(f"Total: {data['total']}")
-    print(f"Resultados en página 1: {len(data['results'])}")
+    print(f"Resultados: {len(data['results'])}")
+    if data['results']:
+        print(f"\nPrimer resultado:")
+        print(json.dumps(data['results'][0], indent=2, ensure_ascii=False))
