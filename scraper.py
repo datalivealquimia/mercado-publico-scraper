@@ -1,6 +1,6 @@
 """
-Mercado Público Scraper - Compra Ágil
-Usa Playwright para evitar bloqueos de CloudFront + BeautifulSoup para parseo
+Mercado Público Scraper - Completo
+Soporta todos los filtros del buscador
 """
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -16,166 +16,204 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://buscador.mercadopublico.cl/compra-agil"
 
 
-def create_browser():
-    """Crea un browser stealth para evitar detección"""
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=[
-            '--disable-blink-features=AutomationControlled',
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu',
-            '--window-size=1920,1080',
-            '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        ]
-    )
-    context = browser.new_context(
-        locale='es-CL',
-        timezone_id='America/Santiago',
-        permissions=['geolocation'],
-        viewport={'width': 1920, 'height': 1080}
-    )
-    page = context.new_page()
+class MercadoPublicoScraper:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.page = None
     
-    # Ocultar webdriver
-    page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {
-            get: () => undefined
-        });
-    """)
+    def start(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
+            headless=True,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+            ]
+        )
+        context = self.browser.new_context(
+            locale='es-CL',
+            viewport={'width': 1920, 'height': 1080}
+        )
+        self.page = context.new_page()
+        self.page.add_init_script(
+            'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+        )
+        return self
     
-    return playwright, browser, page
-
-
-def build_url(
-    date_from: str = None,
-    date_to: str = None,
-    status: str = "2",
-    region: str = "all",
-    page: int = 1,
-    order_by: str = "recent"
-) -> str:
-    """Construye URL con parámetros"""
-    params = {
-        "order_by": order_by,
-        "page_number": page,
-        "region": region,
-        "status": status,
-    }
-    if date_from:
-        params["date_from"] = date_from
-    if date_to:
-        params["date_to"] = date_to
+    def close(self):
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
     
-    from urllib.parse import urlencode
-    return f"{BASE_URL}?{urlencode(params)}"
-
-
-def scrape_page(
-    date_from: str = None,
-    date_to: str = None,
-    status: str = "2",
-    region: str = "all",
-    page: int = 1,
-    order_by: str = "recent"
-) -> dict:
-    """
-    Scraper una página usando Playwright + BeautifulSoup
-    """
-    url = build_url(date_from, date_to, status, region, page, order_by)
-    logger.info(f"Scraping: {url}")
+    def build_url(self, params: dict) -> str:
+        """Construye URL con parámetros"""
+        from urllib.parse import urlencode
+        return f"{BASE_URL}?{urlencode(params)}"
     
-    playwright, browser, page = create_browser()
-    
-    try:
-        response = page.goto(url, wait_until="networkidle", timeout=30000)
-        logger.info(f"Status: {response.status}")
+    def search(
+        self,
+        keyword: str = None,
+        codigo: str = None,
+        estado: str = "publicada",
+        fecha_desde: str = None,
+        fecha_hasta: str = None,
+        region: str = None,
+        rubro: int = None,
+        codigo_organismo: int = None,
+        presupuesto_min: int = None,
+        presupuesto_max: int = None,
+        order_by: str = "reciente",
+        pagina: int = 1,
+        cantidad: int = 15
+    ) -> dict:
+        """
+        Realiza búsqueda con todos los filtros
         
-        # Esperar a que carguen los resultados
-        page.wait_for_selector("text=resultados", timeout=10000)
-        
-        # Obtener el HTML
-        html = page.content()
-        
-        # Parsear con BeautifulSoup
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Extraer total
-        total_text = soup.find(string=re.compile(r'resultados'))
-        total = 0
-        if total_text:
-            match = re.search(r'(\d+)', total_text)
-            if match:
-                total = int(match.group(1))
-        
-        # Extraer compras del HTML
-        compras = extract_compras(soup)
-        
-        return {
-            "results": compras,
-            "total": total,
-            "page": page,
-            "url": url,
-            "timestamp": datetime.now().isoformat()
+        Args:
+            keyword: Palabra clave o título
+            codigo: Número de compra (ej: 4829-46-COT26)
+            estado: publicada, cerrada, oc_emitida, todos
+            fecha_desde: Fecha desde (ddMMyyyy)
+            fecha_hasta: Fecha hasta (ddMMyyyy)
+            region: Código de región (1-16)
+            rubro: Código de rubro
+            codigo_organismo: Código del organismo
+            presupuesto_min: Presupuesto mínimo (CLP)
+            presupuesto_max: Presupuesto máximo (CLP)
+            order_by: reciente, cierre_proximo, presupuesto_asc, presupuesto_desc
+            pagina: Número de página
+            cantidad: Resultados por página
+        """
+        # Mapear estado
+        estado_map = {
+            "publicada": "2",
+            "cerrada": "3", 
+            "oc_emitida": "4",
+            "todos": "1"
         }
         
-    finally:
-        browser.close()
-        playwright.stop()
-
-
-def extract_compras(soup) -> List[dict]:
-    """Extrae compras del HTML parseado"""
-    compras = []
-    
-    # Buscar todos los elementos que contengan códigos COT
-    texto_html = str(soup)
-    
-    # Patrón para encontrar bloques de compras
-    # El código viene como: XXXX-XXX-COT26
-    patrones = re.findall(
-        r'(\d{4,5}-\d{1,3}-COT\d{2})\s*</.*?heading\s*"([^"]+)"[^>]*>.*?>([^<]+)<.*?'
-        r'(\d{2}/\d{2}/\d{4}).*?(\d{2}/\d{2}/\d{4})',
-        texto_html,
-        re.DOTALL
-    )
-    
-    # Buscar de otra forma - por bloques
-    # Encontrar todos los códigos
-    codigos = re.findall(r'(\d{4,5}-\d{1,3}-COT\d{2})', texto_html)
-    
-    # Buscar títulos (h4)
-    titulos = soup.find_all('h4')
-    
-    # Buscar presupuestos
-    presupuestos = re.findall(r'\$\s*([\d.]+)', texto_html)
-    
-    # Buscar organismos - párrafos que contengan palabras clave
-    org_keywords = ['MUNICIPALIDAD', 'HOSPITAL', 'UNIVERSIDAD', 'DEFENSORIA', 'INSTITUTO', 'EJERCITO', 'FUERZAS']
-    organismos = []
-    for p in soup.find_all('p'):
-        text = p.get_text()
-        if any(kw in text.upper() for kw in org_keywords):
-            # Limpiar el texto
-            org = text.strip().split('\n')[0]
-            if org and len(org) > 5:
-                organismos.append(org[:100])
-    
-    # Buscar fechas de publicación y cierre
-    fechas_pub = re.findall(r'Publicada el\s*(\d{2}/\d{2}/\d{4})', texto_html)
-    fechas_cierre = re.findall(r'Finaliza el\s*(\d{2}/\d{2}/\d{4})', texto_html)
-    
-    # Armar las compras
-    for i in range(min(len(codigos), 15)):
+        # Mapear orden
+        order_map = {
+            "reciente": "recent",
+            "cierre_proximo": "closing",
+            "presupuesto_asc": "low_price",
+            "presupuesto_desc": "high_price"
+        }
+        
+        params = {
+            "status": estado_map.get(estado, "2"),
+            "order_by": order_map.get(order_by, "recent"),
+            "page_number": pagina,
+            "region": region if region else "all"
+        }
+        
+        if keyword:
+            params["keyword"] = keyword
+        
+        if codigo:
+            params["codigo"] = codigo
+        
+        if fecha_desde:
+            # Convertir ddMMyyyy a dd/mm/yyyy
+            if len(fecha_desde) == 8:
+                params["date_from"] = f"{fecha_desde[0:2]}/{fecha_desde[2:4]}/{fecha_desde[4:8]}"
+        
+        if fecha_hasta:
+            if len(fecha_hasta) == 8:
+                params["date_to"] = f"{fecha_hasta[0:2]}/{fecha_hasta[2:4]}/{fecha_hasta[4:8]}"
+        
+        url = self.build_url(params)
+        logger.info(f"Buscando: {url}")
+        
         try:
+            response = self.page.goto(url, wait_until="networkidle", timeout=30000)
+            logger.info(f"Status: {response.status}")
+            
+            # Esperar resultados
+            self.page.wait_for_selector("text=resultados", timeout=10000)
+            
+            # Obtener HTML
+            html = self.page.content()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Extraer total
+            total_text = soup.find(string=re.compile(r'resultados'))
+            total = 0
+            if total_text:
+                match = re.search(r'(\d+)', total_text)
+                if match:
+                    total = int(match.group(1))
+            
+            # Extraer compras
+            compras = self._extract_compras(soup)
+            
+            return {
+                "success": True,
+                "data": compras,
+                "pagination": {
+                    "total": total,
+                    "pagina": pagina,
+                    "cantidad": cantidad,
+                    "total_paginas": (total + cantidad - 1) // cantidad if total else 0
+                },
+                "filters": {
+                    "keyword": keyword,
+                    "codigo": codigo,
+                    "estado": estado,
+                    "fecha_desde": fecha_desde,
+                    "fecha_hasta": fecha_hasta,
+                    "region": region,
+                    "order_by": order_by
+                },
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+    
+    def _extract_compras(self, soup) -> List[dict]:
+        """Extrae compras del HTML"""
+        compras = []
+        html = str(soup)
+        
+        # Buscar códigos
+        codigos = re.findall(r'(\d{4,5}-\d{1,3}-COT\d{2})', html)
+        
+        # Buscar títulos
+        titulos = [h.get_text().strip() for h in soup.find_all('h4')]
+        
+        # Buscar presupuestos
+        presupuestos = re.findall(r'\$\s*([\d.]+)', html)
+        
+        # Buscar organismos
+        org_keywords = ['MUNICIPALIDAD', 'HOSPITAL', 'UNIVERSIDAD', 'DEFENSORIA', 
+                       'INSTITUTO', 'EJERCITO', 'FUERZAS', 'DIRECCIÓN', 'CORP', 'SERVICIO']
+        organismos = []
+        for p in soup.find_all('p'):
+            text = p.get_text().strip()
+            if any(kw in text.upper() for kw in org_keywords):
+                org = text.split('\n')[0].strip()
+                if org and len(org) > 5:
+                    organismos.append(org[:120])
+        
+        # Fechas
+        fechas_pub = re.findall(r'Publicada el\s*(\d{2}/\d{2}/\d{4})', html)
+        fechas_cierre = re.findall(r'Finaliza el\s*(\d{2}/\d{2}/\d{4})', html)
+        
+        # Armar resultados
+        for i in range(min(len(codigos), 20)):
             compra = {
                 "codigo": codigos[i] if i < len(codigos) else None,
-                "titulo": titulos[i].get_text().strip() if i < len(titulos) else None,
+                "titulo": titulos[i] if i < len(titulos) else None,
                 "organismo": organismos[i] if i < len(organismos) else None,
                 "presupuesto": f"$ {presupuestos[i]}" if i < len(presupuestos) else None,
                 "fecha_publicacion": fechas_pub[i] if i < len(fechas_pub) else None,
@@ -184,61 +222,38 @@ def extract_compras(soup) -> List[dict]:
             }
             if compra["codigo"]:
                 compras.append(compra)
-        except Exception as e:
-            logger.warning(f"Error armando compra {i}: {e}")
-            continue
-    
-    return compras
+        
+        return compras
 
 
-def scrape_all(
-    date_from: str = None,
-    date_to: str = None,
-    status: str = "2",
-    region: str = "all",
-    max_pages: int = 5,
-    delay: float = 2.0
-) -> List[dict]:
-    """
-    Scraper múltiples páginas con delay entre requests
-    """
-    import time
-    all_results = []
-    
-    for page_num in range(1, max_pages + 1):
-        try:
-            data = scrape_page(
-                date_from=date_from,
-                date_to=date_to,
-                status=status,
-                region=region,
-                page=page_num
-            )
-            results = data.get("results", [])
-            
-            if not results:
-                break
-                
-            all_results.extend(results)
-            logger.info(f"Página {page_num}: {len(results)} resultados")
-            
-            if len(results) < 15:
-                break
-                
-            time.sleep(delay)
-            
-        except Exception as e:
-            logger.error(f"Error en página {page_num}: {e}")
-            break
-    
-    return all_results
+def buscar(**kwargs) -> dict:
+    """Función helper para usar desde Python"""
+    scraper = MercadoPublicoScraper().start()
+    try:
+        result = scraper.search(**kwargs)
+        return result
+    finally:
+        scraper.close()
 
 
 if __name__ == "__main__":
-    print("Ejecutando scraping de prueba...")
-    data = scrape_page()
-    print(f"Total: {data['total']}")
-    print(f"Resultados: {len(data['results'])}")
-    if data['results']:
-        print(f"\nPrimer resultado:")
-        print(json.dumps(data['results'][0], indent=2, ensure_ascii=False))
+    print("=== Mercado Público Scraper ===")
+    print("Buscando compras...")
+    
+    scraper = MercadoPublicoScraper().start()
+    try:
+        result = scraper.search(
+            estado="publicada",
+            order_by="reciente",
+            pagina=1
+        )
+        
+        print(f"\nTotal resultados: {result['pagination']['total']}")
+        print(f"Compras encontradas: {len(result['data'])}")
+        
+        if result['data']:
+            print("\nEjemplo:")
+            print(json.dumps(result['data'][0], indent=2, ensure_ascii=False))
+        
+    finally:
+        scraper.close()
