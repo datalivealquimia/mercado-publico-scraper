@@ -1,68 +1,82 @@
 # Mercado Público Scraper & API
 
-Scraper y API REST para consultas del portal ChileCompra - Compra Ágil.
+API para consultar compras públicas de Chile - Compra Ágil.
 
-## Instalación
+## Datos
+
+- **6,611 resultados** disponibles en el portal
+- Datos extraídos directamente del sitio usando browser automation
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Uso como API
+## Usage
 
 ```bash
 python api.py
 ```
 
-La API estará disponible en `http://localhost:8000`
+API disponible en: **http://localhost:8000**
 
-### Endpoints
+## Endpoints
 
-- `GET /` - Información de la API
-- `GET /health` - Health check
-- `GET /compra-agil` - Buscar compras (parámetros query)
-- `GET /compra-agil/search` - Búsqueda avanzada
-- `GET /compra-agil/url` - Generar URL
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| GET | `/` | Información de la API |
+| GET | `/compra-agil` | Lista compras (soporta paginación y filtros) |
+| GET | `/compra-agil/{codigo}` | Busca por código |
+| GET | `/compra-agil/search?q=texto` | Busca en título u organismo |
 
-### Ejemplos
+## Ejemplos
 
 ```bash
-# Buscar compras publicadas
-curl "http://localhost:8000/compra-agil?date_from=2026-02-01&date_to=2026-03-06"
+# Listar compras (primera página, 15 por página)
+curl "http://localhost:8000/compra-agil"
 
-# Buscar por región
-curl "http://localhost:8000/compra-agil?region=RM&page=1"
+# Segunda página
+curl "http://localhost:8000/compra-agil?page=2"
 
-# Búsqueda avanzada
-curl "http://localhost:8000/compra-agil/search?q=computadores&max_pages=5"
+# Filtrar por organismo
+curl "http://localhost:8000/compra-agil?organismo=municipalidad"
+
+# Filtrar por presupuesto
+curl "http://localhost:8000/compra-agil?presupuesto_min=1000000&presupuesto_max=5000000"
+
+# Buscar por texto
+curl "http://localhost:8000/compra-agil/search?q=salud"
+
+# Buscar por código
+curl "http://localhost:8000/compra-agil/2445-79-COT26"
 ```
 
-## Uso como scraper
+## Estructura de datos
 
-```python
-from scraper import scrape_page, scrape_all
-
-# Una página
-data = scrape_page(date_from="2026-02-01", date_to="2026-03-06")
-
-# Múltiples páginas
-results = scrape_all(date_from="2026-02-01", max_pages=10, delay=2.0)
+```json
+{
+  "codigo": "2445-79-COT26",
+  "titulo": "ADQUISICION DE SMART TV",
+  "organismo": "I MUNICIPALIDAD DE CURICO",
+  "presupuesto": "$ 600.000",
+  "fecha_publicacion": "06/03/2026",
+  "fecha_cierre": "09/03/2026",
+  "estado": "Recibiendo cotizaciones"
+}
 ```
 
-## Docker (opcional)
+## Actualizar datos
 
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-EXPOSE 8000
-CMD ["python", "api.py"]
+Para actualizar los datos, usar el script de scraping con Playwright:
+
+```bash
+python scraper.py
 ```
 
-## Notas
+## Docker
 
-- Respetar delays entre requests para no bloquear el servidor
-- Usar datos responsablemente según términos de ChileCompra
-- Para uso productivo, considerar la API oficial o datos abiertos
+```bash
+docker build -t mercado-publico-api .
+docker run -p 8000:8000 mercado-publico-api
+```

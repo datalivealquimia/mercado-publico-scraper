@@ -1,18 +1,14 @@
 """
 Mercado Público API - FastAPI
-API REST para consultar compras públicas
+API simple que sirve datos extraídos del browser
 """
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
 from pydantic import BaseModel
 from datetime import datetime
-import logging
-
-from scraper import scrape_page, scrape_all, build_url
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import json
+import os
 
 app = FastAPI(
     title="Mercado Público API",
@@ -20,7 +16,6 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,120 +24,98 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Cargar datos
+DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "compras.json")
 
-# Models
-class Compra(BaseModel):
-    codigo: str
-    titulo: str
-    organismo: str
-    region: str
-    presupuesto: Optional[str] = None
-    fecha_publicacion: Optional[str] = None
-    fecha_cierre: Optional[str] = None
-    estado: str
+def load_data():
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
 
-
-class ScrapedData(BaseModel):
-    results: List[dict]
-    total: int
-    page: int
-    url: str
-    timestamp: str
+compras = load_data()
 
 
 @app.get("/")
 def root():
-    """Endpoint raíz"""
     return {
         "name": "Mercado Público API",
         "version": "1.0.0",
+        "total_compras": len(compras),
         "endpoints": {
-            "/compra-agil": "Buscar compras ágiles (parámetros de query)",
-            "/compra-agil/search": "Busqueda avanzada",
-            "/health": "Health check"
+            "/compra-agil": "Lista todas las compras",
+            "/compra-agil/{codigo}": "Busca por código",
+            "/compra-agil/search?q=texto": "Busca en título u organismo"
         }
     }
 
 
-@app.get("/health")
-def health():
-    """Health check"""
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-
-@app.get("/compra-agil", response_model=ScrapedData)
-def buscar_compra_agil(
-    date_from: Optional[str] = Query(None, description="Fecha inicio (YYYY-MM-DD)"),
-    date_to: Optional[str] = Query(None, description="Fecha fin (YYYY-MM-DD)"),
-    status: str = Query("2", description="Estado (2=Publicada, 3=Cerrada, etc.)"),
-    region: str = Query("all", description="Región (all, RM, V, etc.)"),
-    page: int = Query(1, ge=1, description="Número de página"),
-    order_by: str = Query("recent", description="Orden (recent, old, low_price, high_price)")
+@app.get("/compra-agil")
+def list_compras(
+    page: int = Query(1, ge=1),
+    limit: int = Query(15, ge=1, le=100),
+    organismo: Optional[str] = Query(None, description="Filtrar por organismo"),
+    presupuesto_min: Optional[int] = Query(None, description="Presupuesto mínimo"),
+    presupuesto_max: Optional[int] = Query(None, description="Presupuesto máximo")
 ):
-    """
-    Busca compras en Compra Ágil
+    """Lista compras con filtros opcionales"""
+    filtered = compras
     
-    Ejemplos:
-    - /compra-agil?date_from=2026-02-01&date_to=2026-03-06
-    - /compra-agil?status=2&region=RM&page=1
-    """
-    try:
-        data = scrape_page(
-            date_from=date_from,
-            date_to=date_to,
-            status=status,
-            region=region,
-            page=page,
-            order_by=order_by
-        )
-        return data
-    except Exception as e:
-        logger.error(f"Error scraping: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Filtro por organismo
+    if organismo:
+        filtered = [c for c in filtered if organismo.lower() in c.get("organismo", "").lower()]
+    
+    # Filtro por presupuesto
+    if presupuesto_min:
+        filtered = [c for c in filtered if parse_presupuesto(c.get("presupuesto", "0")) >= presupuesto_min]
+    
+    if presupuesto_max:
+        filtered = [c for c in filtered if parse_presupuesto(c.get("presupuesto", "0")) <= presupuesto_max]
+    
+    # Paginación
+    start = (page - 1) * limit
+    end = start + limit
+    
+    return {
+        "data": filtered[start:end],
+        "total": len(filtered),
+        "page": page,
+        "limit": limit,
+        "total_pages": (len(filtered) + limit - 1) // limit
+    }
+
+
+@app.get("/compra-agil/{codigo}")
+def get_by_codigo(codigo: str):
+    """Busca una compra por código"""
+    for c in compras:
+        if c.get("codigo", "").upper() == codigo.upper():
+            return c
+    return {"error": "Compra no encontrada"}
 
 
 @app.get("/compra-agil/search")
-def busqueda_avanzada(
-    q: str = Query(..., description="Palabra clave o código"),
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-    max_pages: int = Query(5, ge=1, le=50, description="Máximo de páginas"),
-    delay: float = Query(2.0, ge=0.5, description="Delay entre requests (segundos)")
+def search(
+    q: str = Query(..., description="Texto a buscar"),
+    limit: int = Query(10, ge=1, le=50)
 ):
-    """
-    Búsqueda avanzada con múltiples páginas
-    """
-    try:
-        results = scrape_all(
-            date_from=date_from,
-            date_to=date_to,
-            max_pages=max_pages,
-            delay=delay
-        )
-        return {
-            "query": q,
-            "results": results,
-            "total_encontrados": len(results),
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Error búsqueda: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/compra-agil/url")
-def generar_url(
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-    status: str = "2",
-    region: str = "all",
-    page: int = 1,
-    order_by: str = "recent"
-):
-    """Genera URL de búsqueda"""
+    """Busca en título y organismo"""
+    q = q.lower()
+    results = []
+    for c in compras:
+        if q in c.get("titulo", "").lower() or q in c.get("organismo", "").lower():
+            results.append(c)
     return {
-        "url": build_url(date_from, date_to, status, region, page, order_by)
+        "query": q,
+        "results": results[:limit],
+        "total": len(results)
     }
+
+
+def parse_presupuesto(pres: str) -> int:
+    """Convierte presupuesto string a número"""
+    try:
+        return int(pres.replace("$", "").replace(".", "").replace(" ", ""))
+    except:
+        return 0
 
 
 if __name__ == "__main__":
